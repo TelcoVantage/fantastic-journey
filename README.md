@@ -20,20 +20,36 @@ Basic header is implemented in pure PowerShell bit math.
 | `CopilotSummaries.csv` | AI Copilot summaries per conversation: feedback given, whether the agent edited the note | `GET /api/v2/conversations/{id}/summaries` |
 | `AgentBehaviorSummary.csv` | One row per agent with everything joined | — |
 
+### Setup (embedded credentials)
+
+The script defaults to the **Australia region** (`mypurecloud.com.au`) and
+reads credentials from the `EMBEDDED CREDENTIALS` block near the top of the
+file. On your **local copy only**, replace the two placeholders:
+
+```powershell
+$script:EmbeddedClientId     = 'PASTE-YOUR-CLIENT-ID-HERE'
+$script:EmbeddedClientSecret = 'PASTE-YOUR-CLIENT-SECRET-HERE'
+```
+
+> **Never commit real credentials back to this repo** — git history and pull
+> requests are readable by everyone with repo access. If a secret is ever
+> committed, delete/rotate that OAuth client in Genesys Cloud Admin
+> immediately. Command-line `-ClientId`/`-ClientSecret`/`-Region` always
+> override the embedded values, so you can also keep the placeholders and
+> pass credentials at runtime.
+
 ### Usage
 
 ```powershell
-# Full report, last 14 days, one team
-.\Get-GcAgentBehavior.ps1 -ClientId $id -ClientSecret $secret `
-    -Region 'mypurecloud.ie' -DaysBack 14 -AgentEmailFilter '*@contoso.com'
+# Full report, last 14 days, one team (embedded creds, AU region)
+.\Get-GcAgentBehavior.ps1 -DaysBack 14 -AgentEmailFilter '*@contoso.com'
 
 # Skip the heavier sections
-.\Get-GcAgentBehavior.ps1 -ClientId $id -ClientSecret $secret -SkipKb -SkipCopilot
+.\Get-GcAgentBehavior.ps1 -SkipKb -SkipCopilot
 
 # Edit an AI Copilot note (conversation summary)
-.\Get-GcAgentBehavior.ps1 -ClientId $id -ClientSecret $secret -Region 'usw2.pure.cloud' `
-    -EditCopilotNote -ConversationId 'abc-123' -SummaryId 'def-456' `
-    -NewNoteText 'Corrected summary text'
+.\Get-GcAgentBehavior.ps1 -EditCopilotNote -ConversationId 'abc-123' `
+    -SummaryId 'def-456' -NewNoteText 'Corrected summary text'
 ```
 
 ### OAuth client requirements

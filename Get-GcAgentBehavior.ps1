@@ -28,14 +28,17 @@
       - Every API response validated explicitly before use
 
 .PARAMETER ClientId
-    OAuth Client Credentials grant client id.
+    OAuth Client Credentials grant client id. Optional - falls back to the
+    EMBEDDED CREDENTIALS block near the top of the script.
 
 .PARAMETER ClientSecret
-    OAuth Client Credentials grant client secret.
+    OAuth Client Credentials grant client secret. Optional - falls back to the
+    EMBEDDED CREDENTIALS block near the top of the script.
 
 .PARAMETER Region
-    Genesys Cloud region API domain, e.g. mypurecloud.com, mypurecloud.ie,
-    mypurecloud.com.au, usw2.pure.cloud, euw2.pure.cloud, cac1.pure.cloud ...
+    Genesys Cloud region API domain. Defaults to the embedded region -
+    mypurecloud.com.au (Australia / Sydney). Other examples: mypurecloud.com,
+    mypurecloud.ie, usw2.pure.cloud, euw2.pure.cloud, cac1.pure.cloud ...
 
 .PARAMETER DaysBack
     Reporting window: now minus N days, in UTC. Default 7.
@@ -60,11 +63,16 @@
     summary). Requires -ConversationId, -SummaryId and -NewNoteText.
 
 .EXAMPLE
-    .\Get-GcAgentBehavior.ps1 -ClientId $id -ClientSecret $secret -Region 'mypurecloud.ie' -DaysBack 14
+    # Uses the embedded credentials and Australia region - no arguments needed
+    .\Get-GcAgentBehavior.ps1 -DaysBack 14
 
 .EXAMPLE
-    .\Get-GcAgentBehavior.ps1 -ClientId $id -ClientSecret $secret -Region 'usw2.pure.cloud' `
-        -EditCopilotNote -ConversationId 'abc-123' -SummaryId 'def-456' -NewNoteText 'Corrected summary text'
+    .\Get-GcAgentBehavior.ps1 -EditCopilotNote -ConversationId 'abc-123' `
+        -SummaryId 'def-456' -NewNoteText 'Corrected summary text'
+
+.EXAMPLE
+    # Command-line credentials still override the embedded block
+    .\Get-GcAgentBehavior.ps1 -ClientId $id -ClientSecret $secret -Region 'mypurecloud.ie'
 
 .NOTES
     Required OAuth scopes / permissions (grant only what you use):
@@ -82,9 +90,11 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]  [string]$ClientId,
-    [Parameter(Mandatory = $true)]  [string]$ClientSecret,
-    [Parameter(Mandatory = $false)] [string]$Region = 'mypurecloud.com',
+    # ClientId / ClientSecret / Region fall back to the embedded values in the
+    # EMBEDDED CREDENTIALS block below when not supplied on the command line.
+    [Parameter(Mandatory = $false)] [string]$ClientId = '',
+    [Parameter(Mandatory = $false)] [string]$ClientSecret = '',
+    [Parameter(Mandatory = $false)] [string]$Region = '',
     [Parameter(Mandatory = $false)] [int]$DaysBack = 7,
     [Parameter(Mandatory = $false)] [string]$OutputDir = '',
     [Parameter(Mandatory = $false)] [string]$AgentEmailFilter = '*',
@@ -100,6 +110,28 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# ===========================================================================
+# EMBEDDED CREDENTIALS - Australia (APSE2) region
+# ---------------------------------------------------------------------------
+# Paste your OAuth Client Credentials here on YOUR LOCAL COPY ONLY.
+# NEVER commit real credentials to source control - anyone with repo access
+# (including via pull requests and git history) can read them. If a secret
+# does get committed, treat it as compromised: delete/rotate the OAuth client
+# in Genesys Cloud Admin immediately.
+# Command-line -ClientId / -ClientSecret / -Region still override these.
+# ===========================================================================
+$script:EmbeddedClientId     = 'PASTE-YOUR-CLIENT-ID-HERE'
+$script:EmbeddedClientSecret = 'PASTE-YOUR-CLIENT-SECRET-HERE'
+$script:EmbeddedRegion       = 'mypurecloud.com.au'   # Australia (Sydney / APSE2)
+
+if ($ClientId -eq '')     { $ClientId     = $script:EmbeddedClientId }
+if ($ClientSecret -eq '') { $ClientSecret = $script:EmbeddedClientSecret }
+if ($Region -eq '')       { $Region       = $script:EmbeddedRegion }
+
+if ($ClientId -like 'PASTE-YOUR-*' -or $ClientSecret -like 'PASTE-YOUR-*') {
+    throw 'No credentials configured. Edit the EMBEDDED CREDENTIALS block near the top of this script (local copy only), or pass -ClientId and -ClientSecret on the command line.'
+}
 
 # ---------------------------------------------------------------------------
 # Endpoint templates most likely to differ between orgs / API releases.
