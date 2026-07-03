@@ -11,6 +11,13 @@
       4. Knowledge Base feedback       (how often each agent submits KB article feedback)
       5. Copilot / AI summary activity (summaries per conversation, feedback + edit signals)
       6. Edit an AI Copilot note       (-EditCopilotNote action: update a conversation summary)
+      7. Survey / NPS scores           (survey aggregates per agent + per-response NPS
+                                        promoter/passive/detractor classification)
+      8. Quality evaluation scores     (evaluation aggregates - avg total & critical score)
+      9. Conversation sentiment        (Speech & Text Analytics sentiment per conversation,
+                                        averaged per agent)
+     10. Media-type & wrap-up mix      (interactions per agent split by media type and
+                                        wrap-up code)
 
     Everything is exported as CSV into an output folder, plus a per-agent roll-up
     (AgentBehaviorSummary.csv) that joins all data sets on the agent.
@@ -49,13 +56,15 @@
 .PARAMETER AgentEmailFilter
     Optional wildcard filter on agent email (e.g. "*@contoso.com" or "j.smith*").
 
-.PARAMETER MaxConversationsForCopilot
-    Cap on conversations scanned for Copilot summaries (1 API call each). Default 200.
+.PARAMETER MaxScanConversations
+    Cap on recent conversations scanned for the per-conversation sections
+    (Copilot summaries, sentiment, survey responses - up to 3 API calls each).
+    Default 200. Alias: MaxConversationsForCopilot (back-compat).
 
 .PARAMETER MaxKbDocuments
     Cap on KB documents scanned for feedback (1 API call each). Default 500.
 
-.PARAMETER SkipWfm / SkipKb / SkipCopilot
+.PARAMETER SkipWfm / SkipKb / SkipCopilot / SkipSurveys / SkipEvaluations / SkipSentiment
     Skip the corresponding (heavier / permission-sensitive) sections.
 
 .PARAMETER EditCopilotNote
@@ -77,7 +86,10 @@
 .NOTES
     Required OAuth scopes / permissions (grant only what you use):
       analytics:conversationAggregate:view, analytics:userAggregate:view,
-      analytics:conversationDetail:view, directory:user:view,
+      analytics:conversationDetail:view, analytics:surveyAggregate:view,
+      analytics:evaluationAggregate:view, quality:survey:view,
+      quality:surveyForm:view, speechAndTextAnalytics:data:view,
+      routing:wrapupCode:view, directory:user:view,
       wfm:realtimeAdherence:view, knowledge:knowledgebase:view,
       knowledge:document:view, conversation:summary:view (+ edit for -EditCopilotNote)
 
@@ -98,11 +110,14 @@ param(
     [Parameter(Mandatory = $false)] [int]$DaysBack = 7,
     [Parameter(Mandatory = $false)] [string]$OutputDir = '',
     [Parameter(Mandatory = $false)] [string]$AgentEmailFilter = '*',
-    [Parameter(Mandatory = $false)] [int]$MaxConversationsForCopilot = 200,
+    [Parameter(Mandatory = $false)] [Alias('MaxConversationsForCopilot')] [int]$MaxScanConversations = 200,
     [Parameter(Mandatory = $false)] [int]$MaxKbDocuments = 500,
     [Parameter(Mandatory = $false)] [switch]$SkipWfm,
     [Parameter(Mandatory = $false)] [switch]$SkipKb,
     [Parameter(Mandatory = $false)] [switch]$SkipCopilot,
+    [Parameter(Mandatory = $false)] [switch]$SkipSurveys,
+    [Parameter(Mandatory = $false)] [switch]$SkipEvaluations,
+    [Parameter(Mandatory = $false)] [switch]$SkipSentiment,
     [Parameter(Mandatory = $false)] [switch]$EditCopilotNote,
     [Parameter(Mandatory = $false)] [string]$ConversationId = '',
     [Parameter(Mandatory = $false)] [string]$SummaryId = '',
@@ -629,20 +644,17 @@ function Get-GcKbFeedback {
     return ,$rows
 }
 
-function Get-GcCopilotActivity {
-    <#  Section 5: Copilot / AI summary behavior. Pulls recent conversation ids
-        via analytics detail query, then fetches each conversation's summaries
-        and records feedback + edit signals where the payload exposes them.
-        Capped by -MaxConversationsForCopilot (one API call per conversation).  #>
+function Get-GcRecentConversations {
+    <#  Shared scan set: most recent conversation ids (with agent participants)
+        from analytics details. Used by the Copilot, sentiment and
+        survey-response sections so the details query runs only once.
+        Capped by -MaxScanConversations.  #>
     param([string]$Interval)
 
-    Write-Host ('Querying Copilot / AI summaries (capped at ' + $MaxConversationsForCopilot + ' conversations)...') -ForegroundColor Cyan
-    $rows = @()
-
-    # 1) Recent conversation ids from analytics details.
-    $convIds = @()
+    Write-Host ('Building recent conversation scan set (capped at ' + $MaxScanConversations + ')...') -ForegroundColor Cyan
+    $convs = @()
     $page = 1
-    while ($convIds.Count -lt $MaxConversationsForCopilot) {
+    while ($convs.Count -lt $MaxScanConversations) {
         $body = @{
             interval = $Interval
             order    = 'desc'
@@ -652,17 +664,40 @@ function Get-GcCopilotActivity {
         $resp = Invoke-GcApi -Method 'POST' -Path '/api/v2/analytics/conversations/details/query' -Body $body -SoftFail
         if ($null -eq $resp -or $null -eq $resp.conversations -or $resp.conversations.Count -eq 0) { break }
         foreach ($c in $resp.conversations) {
-            if ($convIds.Count -ge $MaxConversationsForCopilot) { break }
-            $convIds += [string]$c.conversationId
+            if ($convs.Count -ge $MaxScanConversations) { break }
+            $agentIds = @()
+            if ($null -ne $c.participants) {
+                foreach ($p in $c.participants) {
+                    if ($p.purpose -eq 'agent' -and $null -ne $p.userId) {
+                        if ($agentIds -notcontains [string]$p.userId) { $agentIds += [string]$p.userId }
+                    }
+                }
+            }
+            $convs += New-Object PSObject -Property @{
+                ConversationId = [string]$c.conversationId
+                AgentIds       = $agentIds
+                Start          = [string]$c.conversationStart
+            }
         }
         if ($resp.conversations.Count -lt 100) { break }
         $page += 1
     }
-    Write-Host ('  Scanning ' + $convIds.Count + ' conversations for summaries...') -ForegroundColor DarkCyan
+    Write-Host ('  Scan set: ' + $convs.Count + ' conversations.') -ForegroundColor Green
+    return ,$convs
+}
 
-    # 2) Summaries per conversation.
+function Get-GcCopilotActivity {
+    <#  Section 5: Copilot / AI summary behavior. Fetches each scanned
+        conversation's summaries and records feedback + edit signals where
+        the payload exposes them (one API call per conversation).  #>
+    param($RecentConversations)
+
+    Write-Host ('Querying Copilot / AI summaries over ' + $RecentConversations.Count + ' conversations...') -ForegroundColor Cyan
+    $rows = @()
+
     $notFoundCount = 0
-    foreach ($cid in $convIds) {
+    foreach ($conv in $RecentConversations) {
+        $cid = $conv.ConversationId
         $path = $script:CopilotSummariesPathTemplate.Replace('{0}', $cid)
         $sumResp = Invoke-GcApi -Method 'GET' -Path $path -SoftFail
         if ($null -eq $sumResp) { $notFoundCount += 1; continue }
@@ -677,6 +712,7 @@ function Get-GcCopilotActivity {
             if ($null -ne $s.agent -and $null -ne $s.agent.id) { $agentId = [string]$s.agent.id }
             elseif ($null -ne $s.userId) { $agentId = [string]$s.userId }
             elseif ($null -ne $s.modifiedBy -and $null -ne $s.modifiedBy.id) { $agentId = [string]$s.modifiedBy.id }
+            elseif ($conv.AgentIds.Count -gt 0) { $agentId = [string]$conv.AgentIds[0] }
 
             $summaryText = ''
             if ($null -ne $s.summary) {
@@ -713,10 +749,398 @@ function Get-GcCopilotActivity {
         }
     }
 
-    if ($notFoundCount -eq $convIds.Count -and $convIds.Count -gt 0) {
+    if ($notFoundCount -eq $RecentConversations.Count -and $RecentConversations.Count -gt 0) {
         Write-Warning ('  No summaries returned for any conversation. Either Copilot summarization is not enabled, or your org uses a different endpoint - verify "' + $script:CopilotSummariesPathTemplate + '" in the API Explorer and adjust the template at the top of this script.')
     }
     Write-Host ('  Copilot summary rows: ' + $rows.Count) -ForegroundColor Green
+    return ,$rows
+}
+
+function Get-GcSurveyAggregates {
+    <#  Section 7a: post-interaction survey scores per agent (survey aggregates).
+        oSurveyTotalScore is a 0-100 percentage; average = sum / count.
+        Tries a rich metric set first, falls back to the score-only metric if
+        the org's API release rejects any of the count metrics.  #>
+    param($Users, [string]$Interval)
+
+    Write-Host 'Querying survey score aggregates...' -ForegroundColor Cyan
+    $rows = @()
+    $chunkSize = 100
+    $index = 0
+
+    while ($index -lt $Users.Count) {
+        $chunk = @()
+        $j = $index
+        while ($j -lt $Users.Count -and $j -lt ($index + $chunkSize)) { $chunk += $Users[$j].UserId; $j += 1 }
+        $index += $chunkSize
+
+        $body = @{
+            interval = $Interval
+            groupBy  = @('userId')
+            metrics  = @('oSurveyTotalScore', 'nSurveysSent', 'nSurveysStarted', 'nSurveysAbandoned')
+            filter   = New-GcUserIdFilter -UserIds $chunk
+        }
+        $resp = Invoke-GcApi -Method 'POST' -Path '/api/v2/analytics/surveys/aggregates/query' -Body $body -SoftFail
+        if ($null -eq $resp) {
+            # Retry with the one metric guaranteed across releases.
+            $body['metrics'] = @('oSurveyTotalScore')
+            $resp = Invoke-GcApi -Method 'POST' -Path '/api/v2/analytics/surveys/aggregates/query' -Body $body -SoftFail
+        }
+        if ($null -eq $resp -or $null -eq $resp.results) { continue }
+
+        foreach ($result in $resp.results) {
+            $uid = ''
+            if ($null -ne $result.group -and $null -ne $result.group.userId) { $uid = [string]$result.group.userId }
+            if ($uid -eq '') { continue }
+
+            $scoreSum = 0; $scoreCount = 0; $sent = 0; $started = 0; $abandoned = 0
+            foreach ($d in $result.data) {
+                foreach ($m in $d.metrics) {
+                    $sum = 0; $count = 0
+                    if ($null -ne $m.stats) {
+                        if ($null -ne $m.stats.sum)   { $sum   = [double]$m.stats.sum }
+                        if ($null -ne $m.stats.count) { $count = [int]$m.stats.count }
+                    }
+                    if     ($m.metric -eq 'oSurveyTotalScore') { $scoreSum += $sum; $scoreCount += $count }
+                    elseif ($m.metric -eq 'nSurveysSent')      { $sent      += $count }
+                    elseif ($m.metric -eq 'nSurveysStarted')   { $started   += $count }
+                    elseif ($m.metric -eq 'nSurveysAbandoned') { $abandoned += $count }
+                }
+            }
+
+            $avg = ''
+            if ($scoreCount -gt 0) { $avg = ('{0:N1}' -f ($scoreSum / $scoreCount)) }
+
+            $rows += New-Object PSObject -Property @{
+                UserId           = $uid
+                SurveysScored    = $scoreCount
+                AvgTotalScorePct = $avg
+                SurveysSent      = $sent
+                SurveysStarted   = $started
+                SurveysAbandoned = $abandoned
+            }
+        }
+    }
+    Write-Host ('  Survey aggregate rows: ' + $rows.Count) -ForegroundColor Green
+    return ,$rows
+}
+
+function Get-GcSurveyResponses {
+    <#  Section 7b: individual survey responses with NPS extraction.
+        Walks the shared conversation scan set, pulls each conversation's
+        completed surveys, then looks up the survey form (cached) to find
+        questions of NPS type and classify the 0-10 answer:
+        9-10 promoter, 7-8 passive, 0-6 detractor. Per-agent NPS is computed
+        in the roll-up as (promoters - detractors) / responses * 100.  #>
+    param($RecentConversations)
+
+    Write-Host ('Querying individual survey responses over ' + $RecentConversations.Count + ' conversations...') -ForegroundColor Cyan
+    $rows = @()
+    $formCache = @{}   # formId -> hashtable of questionId -> question type
+
+    foreach ($conv in $RecentConversations) {
+        $cid = $conv.ConversationId
+        $resp = Invoke-GcApi -Method 'GET' -Path ('/api/v2/quality/conversations/' + $cid + '/surveys') -SoftFail
+        if ($null -eq $resp) { continue }
+
+        # Endpoint returns a bare array of surveys.
+        foreach ($s in $resp) {
+            if ($null -eq $s -or $null -eq $s.id) { continue }
+
+            $agentId = ''
+            if ($null -ne $s.agent -and $null -ne $s.agent.id) { $agentId = [string]$s.agent.id }
+            elseif ($conv.AgentIds.Count -gt 0) { $agentId = [string]$conv.AgentIds[0] }
+
+            $status = ''
+            if ($null -ne $s.status) { $status = [string]$s.status }
+
+            $totalScore = ''
+            if ($null -ne $s.answers -and $null -ne $s.answers.totalScore) {
+                $totalScore = [string]$s.answers.totalScore
+            }
+
+            # --- NPS extraction via the survey form's question types ---
+            $npsScore = ''
+            $formId = ''
+            if ($null -ne $s.surveyForm -and $null -ne $s.surveyForm.id) { $formId = [string]$s.surveyForm.id }
+
+            if ($formId -ne '' -and -not $formCache.ContainsKey($formId)) {
+                $qTypes = @{}
+                $form = Invoke-GcApi -Method 'GET' -Path ('/api/v2/quality/forms/surveys/' + $formId) -SoftFail
+                if ($null -ne $form -and $null -ne $form.questionGroups) {
+                    foreach ($qg in $form.questionGroups) {
+                        if ($null -eq $qg.questions) { continue }
+                        foreach ($q in $qg.questions) {
+                            if ($null -ne $q.id -and $null -ne $q.type) { $qTypes[[string]$q.id] = [string]$q.type }
+                        }
+                    }
+                }
+                $formCache[$formId] = $qTypes
+            }
+
+            if ($formId -ne '' -and $null -ne $s.answers -and $null -ne $s.answers.questionGroupScores) {
+                $qTypes = $formCache[$formId]
+                foreach ($qgs in $s.answers.questionGroupScores) {
+                    if ($null -eq $qgs.questionScores) { continue }
+                    foreach ($qs in $qgs.questionScores) {
+                        $qid = ''
+                        if ($null -ne $qs.questionId) { $qid = [string]$qs.questionId }
+                        if ($qid -eq '' -or -not $qTypes.ContainsKey($qid)) { continue }
+                        if ($qTypes[$qid] -like '*nps*' -and $null -ne $qs.score) {
+                            $npsScore = [string]$qs.score
+                        }
+                    }
+                }
+            }
+
+            $npsBand = ''
+            if ($npsScore -ne '') {
+                $npsInt = [int][double]$npsScore
+                if     ($npsInt -ge 9) { $npsBand = 'Promoter' }
+                elseif ($npsInt -ge 7) { $npsBand = 'Passive' }
+                else                   { $npsBand = 'Detractor' }
+            }
+
+            $rows += New-Object PSObject -Property @{
+                UserId         = $agentId
+                ConversationId = $cid
+                SurveyId       = [string]$s.id
+                Status         = $status
+                TotalScorePct  = $totalScore
+                NpsScore       = $npsScore
+                NpsBand        = $npsBand
+                CompletedDate  = [string]$s.completedDate
+            }
+        }
+    }
+    Write-Host ('  Survey response rows: ' + $rows.Count) -ForegroundColor Green
+    return ,$rows
+}
+
+function Get-GcEvaluationScores {
+    <#  Section 8: quality evaluation aggregates per agent - average total
+        score and average critical score (both 0-100 percentages).  #>
+    param($Users, [string]$Interval)
+
+    Write-Host 'Querying quality evaluation scores...' -ForegroundColor Cyan
+    $rows = @()
+    $chunkSize = 100
+    $index = 0
+
+    while ($index -lt $Users.Count) {
+        $chunk = @()
+        $j = $index
+        while ($j -lt $Users.Count -and $j -lt ($index + $chunkSize)) { $chunk += $Users[$j].UserId; $j += 1 }
+        $index += $chunkSize
+
+        $body = @{
+            interval = $Interval
+            groupBy  = @('userId')
+            metrics  = @('oTotalScore', 'oTotalCriticalScore')
+            filter   = New-GcUserIdFilter -UserIds $chunk
+        }
+        $resp = Invoke-GcApi -Method 'POST' -Path '/api/v2/analytics/evaluations/aggregates/query' -Body $body -SoftFail
+        if ($null -eq $resp -or $null -eq $resp.results) { continue }
+
+        foreach ($result in $resp.results) {
+            $uid = ''
+            if ($null -ne $result.group -and $null -ne $result.group.userId) { $uid = [string]$result.group.userId }
+            if ($uid -eq '') { continue }
+
+            $totSum = 0; $totCount = 0; $critSum = 0; $critCount = 0
+            foreach ($d in $result.data) {
+                foreach ($m in $d.metrics) {
+                    $sum = 0; $count = 0
+                    if ($null -ne $m.stats) {
+                        if ($null -ne $m.stats.sum)   { $sum   = [double]$m.stats.sum }
+                        if ($null -ne $m.stats.count) { $count = [int]$m.stats.count }
+                    }
+                    if     ($m.metric -eq 'oTotalScore')         { $totSum += $sum; $totCount += $count }
+                    elseif ($m.metric -eq 'oTotalCriticalScore') { $critSum += $sum; $critCount += $count }
+                }
+            }
+
+            $avgTot = ''
+            if ($totCount -gt 0) { $avgTot = ('{0:N1}' -f ($totSum / $totCount)) }
+            $avgCrit = ''
+            if ($critCount -gt 0) { $avgCrit = ('{0:N1}' -f ($critSum / $critCount)) }
+
+            $rows += New-Object PSObject -Property @{
+                UserId              = $uid
+                Evaluations         = $totCount
+                AvgTotalScorePct    = $avgTot
+                AvgCriticalScorePct = $avgCrit
+            }
+        }
+    }
+    Write-Host ('  Evaluation rows: ' + $rows.Count) -ForegroundColor Green
+    return ,$rows
+}
+
+function Get-GcSentiment {
+    <#  Section 9: Speech & Text Analytics sentiment per conversation,
+        attributed to the conversation's agent participant(s). Requires STA
+        sentiment analysis to be enabled for the queues/flows involved.
+        One API call per scanned conversation.  #>
+    param($RecentConversations)
+
+    Write-Host ('Querying conversation sentiment over ' + $RecentConversations.Count + ' conversations...') -ForegroundColor Cyan
+    $rows = @()
+
+    foreach ($conv in $RecentConversations) {
+        $cid = $conv.ConversationId
+        $resp = Invoke-GcApi -Method 'GET' -Path ('/api/v2/speechandtextanalytics/conversations/' + $cid) -SoftFail
+        if ($null -eq $resp -or $null -eq $resp.sentimentScore) { continue }
+
+        $score = [string]$resp.sentimentScore
+        $trend = ''
+        if ($null -ne $resp.sentimentTrend) { $trend = [string]$resp.sentimentTrend }
+
+        if ($conv.AgentIds.Count -eq 0) {
+            $rows += New-Object PSObject -Property @{
+                UserId = ''; ConversationId = $cid
+                SentimentScore = $score; SentimentTrend = $trend
+            }
+        } else {
+            foreach ($aid in $conv.AgentIds) {
+                $rows += New-Object PSObject -Property @{
+                    UserId = [string]$aid; ConversationId = $cid
+                    SentimentScore = $score; SentimentTrend = $trend
+                }
+            }
+        }
+    }
+    Write-Host ('  Sentiment rows: ' + $rows.Count) -ForegroundColor Green
+    return ,$rows
+}
+
+function Get-GcMediaTypeBreakdown {
+    <#  Section 10a: interactions and handle time per agent split by media
+        type (voice, chat, email, message, callback...).  #>
+    param($Users, [string]$Interval)
+
+    Write-Host 'Querying media-type breakdown...' -ForegroundColor Cyan
+    $rows = @()
+    $chunkSize = 100
+    $index = 0
+
+    while ($index -lt $Users.Count) {
+        $chunk = @()
+        $j = $index
+        while ($j -lt $Users.Count -and $j -lt ($index + $chunkSize)) { $chunk += $Users[$j].UserId; $j += 1 }
+        $index += $chunkSize
+
+        $body = @{
+            interval = $Interval
+            groupBy  = @('userId', 'mediaType')
+            metrics  = @('nOffered', 'tHandle')
+            filter   = New-GcUserIdFilter -UserIds $chunk
+        }
+        $resp = Invoke-GcApi -Method 'POST' -Path '/api/v2/analytics/conversations/aggregates/query' -Body $body -SoftFail
+        if ($null -eq $resp -or $null -eq $resp.results) { continue }
+
+        foreach ($result in $resp.results) {
+            $uid = ''; $media = ''
+            if ($null -ne $result.group) {
+                if ($null -ne $result.group.userId)    { $uid   = [string]$result.group.userId }
+                if ($null -ne $result.group.mediaType) { $media = [string]$result.group.mediaType }
+            }
+            if ($uid -eq '') { continue }
+
+            $offered = 0; $handleMs = 0; $handled = 0
+            foreach ($d in $result.data) {
+                foreach ($m in $d.metrics) {
+                    $sum = 0; $count = 0
+                    if ($null -ne $m.stats) {
+                        if ($null -ne $m.stats.sum)   { $sum   = [double]$m.stats.sum }
+                        if ($null -ne $m.stats.count) { $count = [int]$m.stats.count }
+                    }
+                    if     ($m.metric -eq 'nOffered') { $offered  += $count }
+                    elseif ($m.metric -eq 'tHandle')  { $handleMs += $sum; $handled += $count }
+                }
+            }
+
+            $rows += New-Object PSObject -Property @{
+                UserId      = $uid
+                MediaType   = $media
+                Offered     = $offered
+                Handled     = $handled
+                HandleHours = Format-GcHours -Milliseconds $handleMs
+            }
+        }
+    }
+    Write-Host ('  Media-type rows: ' + $rows.Count) -ForegroundColor Green
+    return ,$rows
+}
+
+function Get-GcWrapUpBreakdown {
+    <#  Section 10b: wrap-up code distribution per agent - how each agent
+        disposition-codes their interactions. Code ids are resolved to names
+        via the routing wrap-up codes list.  #>
+    param($Users, [string]$Interval)
+
+    Write-Host 'Querying wrap-up code breakdown...' -ForegroundColor Cyan
+
+    # Resolve wrap-up code ids -> names (capped at 5 pages / 1000 codes).
+    $codeNames = @{}
+    $page = 1
+    while ($page -le 5) {
+        $resp = Invoke-GcApi -Method 'GET' -Path ('/api/v2/routing/wrapupcodes?pageSize=200&pageNumber=' + $page) -SoftFail
+        if ($null -eq $resp -or $null -eq $resp.entities -or $resp.entities.Count -eq 0) { break }
+        foreach ($c in $resp.entities) { $codeNames[[string]$c.id] = [string]$c.name }
+        if ($null -eq $resp.pageCount -or $page -ge [int]$resp.pageCount) { break }
+        $page += 1
+    }
+
+    $rows = @()
+    $chunkSize = 100
+    $index = 0
+
+    while ($index -lt $Users.Count) {
+        $chunk = @()
+        $j = $index
+        while ($j -lt $Users.Count -and $j -lt ($index + $chunkSize)) { $chunk += $Users[$j].UserId; $j += 1 }
+        $index += $chunkSize
+
+        $body = @{
+            interval = $Interval
+            groupBy  = @('userId', 'wrapUpCode')
+            metrics  = @('nOffered', 'tHandle')
+            filter   = New-GcUserIdFilter -UserIds $chunk
+        }
+        $resp = Invoke-GcApi -Method 'POST' -Path '/api/v2/analytics/conversations/aggregates/query' -Body $body -SoftFail
+        if ($null -eq $resp -or $null -eq $resp.results) { continue }
+
+        foreach ($result in $resp.results) {
+            $uid = ''; $codeId = ''
+            if ($null -ne $result.group) {
+                if ($null -ne $result.group.userId)     { $uid    = [string]$result.group.userId }
+                if ($null -ne $result.group.wrapUpCode) { $codeId = [string]$result.group.wrapUpCode }
+            }
+            if ($uid -eq '' -or $codeId -eq '') { continue }
+
+            $codeName = $codeId
+            if ($codeNames.ContainsKey($codeId)) { $codeName = $codeNames[$codeId] }
+
+            $interactions = 0
+            foreach ($d in $result.data) {
+                foreach ($m in $d.metrics) {
+                    $count = 0
+                    if ($null -ne $m.stats -and $null -ne $m.stats.count) { $count = [int]$m.stats.count }
+                    if ($m.metric -eq 'tHandle' -and $count -gt $interactions) { $interactions = $count }
+                    if ($m.metric -eq 'nOffered' -and $count -gt $interactions) { $interactions = $count }
+                }
+            }
+
+            $rows += New-Object PSObject -Property @{
+                UserId       = $uid
+                WrapUpCode   = $codeName
+                WrapUpCodeId = $codeId
+                Interactions = $interactions
+            }
+        }
+    }
+    Write-Host ('  Wrap-up rows: ' + $rows.Count) -ForegroundColor Green
     return ,$rows
 }
 
@@ -794,12 +1218,28 @@ function Get-GcUserEmail { param([string]$Id)
 # ---- Collect ----
 $callRows    = Get-GcCallActivity -Users $users -Interval $interval
 $statusRows  = Get-GcStatusTime  -Users $users -Interval $interval
+$mediaRows   = Get-GcMediaTypeBreakdown -Users $users -Interval $interval
+$wrapUpRows  = Get-GcWrapUpBreakdown -Users $users -Interval $interval
 $wfmRows     = @()
 if (-not $SkipWfm) { $wfmRows = Get-GcWfmAdherence -Users $users }
 $kbRows      = @()
 if (-not $SkipKb) { $kbRows = Get-GcKbFeedback }
+$evalRows    = @()
+if (-not $SkipEvaluations) { $evalRows = Get-GcEvaluationScores -Users $users -Interval $interval }
+$surveyAggRows = @()
+if (-not $SkipSurveys) { $surveyAggRows = Get-GcSurveyAggregates -Users $users -Interval $interval }
+
+# Shared per-conversation scan set - only built if a consumer section runs.
+$recentConvs = @()
+if ((-not $SkipCopilot) -or (-not $SkipSentiment) -or (-not $SkipSurveys)) {
+    $recentConvs = Get-GcRecentConversations -Interval $interval
+}
 $copilotRows = @()
-if (-not $SkipCopilot) { $copilotRows = Get-GcCopilotActivity -Interval $interval }
+if (-not $SkipCopilot) { $copilotRows = Get-GcCopilotActivity -RecentConversations $recentConvs }
+$sentimentRows = @()
+if (-not $SkipSentiment) { $sentimentRows = Get-GcSentiment -RecentConversations $recentConvs }
+$surveyRespRows = @()
+if (-not $SkipSurveys) { $surveyRespRows = Get-GcSurveyResponses -RecentConversations $recentConvs }
 
 # ---- Export raw sections (explicit column order via Select-Object) ----
 Write-Host 'Exporting CSVs...' -ForegroundColor Cyan
@@ -886,6 +1326,93 @@ if ($copilotRows.Count -gt 0) {
         Export-Csv -Path (Join-Path $OutputDir 'CopilotSummaries.csv') -NoTypeInformation
 }
 
+$mediaExport = @()
+foreach ($r in $mediaRows) {
+    $mediaExport += New-Object PSObject -Property @{
+        AgentName = Get-GcUserName -Id $r.UserId; AgentEmail = Get-GcUserEmail -Id $r.UserId
+        UserId = $r.UserId; MediaType = $r.MediaType; Offered = $r.Offered
+        Handled = $r.Handled; HandleHours = $r.HandleHours
+    }
+}
+$mediaExport |
+    Select-Object AgentName, AgentEmail, UserId, MediaType, Offered, Handled, HandleHours |
+    Sort-Object AgentName, MediaType |
+    Export-Csv -Path (Join-Path $OutputDir 'MediaTypeBreakdown.csv') -NoTypeInformation
+
+$wrapUpExport = @()
+foreach ($r in $wrapUpRows) {
+    $wrapUpExport += New-Object PSObject -Property @{
+        AgentName = Get-GcUserName -Id $r.UserId; AgentEmail = Get-GcUserEmail -Id $r.UserId
+        UserId = $r.UserId; WrapUpCode = $r.WrapUpCode; WrapUpCodeId = $r.WrapUpCodeId
+        Interactions = $r.Interactions
+    }
+}
+$wrapUpExport |
+    Select-Object AgentName, AgentEmail, UserId, WrapUpCode, WrapUpCodeId, Interactions |
+    Sort-Object AgentName, WrapUpCode |
+    Export-Csv -Path (Join-Path $OutputDir 'WrapUpCodes.csv') -NoTypeInformation
+
+if ($evalRows.Count -gt 0) {
+    $evalExport = @()
+    foreach ($r in $evalRows) {
+        $evalExport += New-Object PSObject -Property @{
+            AgentName = Get-GcUserName -Id $r.UserId; AgentEmail = Get-GcUserEmail -Id $r.UserId
+            UserId = $r.UserId; Evaluations = $r.Evaluations
+            AvgTotalScorePct = $r.AvgTotalScorePct; AvgCriticalScorePct = $r.AvgCriticalScorePct
+        }
+    }
+    $evalExport |
+        Select-Object AgentName, AgentEmail, UserId, Evaluations, AvgTotalScorePct, AvgCriticalScorePct |
+        Sort-Object AgentName |
+        Export-Csv -Path (Join-Path $OutputDir 'EvaluationScores.csv') -NoTypeInformation
+}
+
+if ($surveyAggRows.Count -gt 0) {
+    $svAggExport = @()
+    foreach ($r in $surveyAggRows) {
+        $svAggExport += New-Object PSObject -Property @{
+            AgentName = Get-GcUserName -Id $r.UserId; AgentEmail = Get-GcUserEmail -Id $r.UserId
+            UserId = $r.UserId; SurveysScored = $r.SurveysScored; AvgTotalScorePct = $r.AvgTotalScorePct
+            SurveysSent = $r.SurveysSent; SurveysStarted = $r.SurveysStarted; SurveysAbandoned = $r.SurveysAbandoned
+        }
+    }
+    $svAggExport |
+        Select-Object AgentName, AgentEmail, UserId, SurveysScored, AvgTotalScorePct, SurveysSent, SurveysStarted, SurveysAbandoned |
+        Sort-Object AgentName |
+        Export-Csv -Path (Join-Path $OutputDir 'SurveyScores.csv') -NoTypeInformation
+}
+
+if ($surveyRespRows.Count -gt 0) {
+    $svRespExport = @()
+    foreach ($r in $surveyRespRows) {
+        $svRespExport += New-Object PSObject -Property @{
+            AgentName = Get-GcUserName -Id $r.UserId; AgentEmail = Get-GcUserEmail -Id $r.UserId
+            UserId = $r.UserId; ConversationId = $r.ConversationId; SurveyId = $r.SurveyId
+            Status = $r.Status; TotalScorePct = $r.TotalScorePct
+            NpsScore = $r.NpsScore; NpsBand = $r.NpsBand; CompletedDate = $r.CompletedDate
+        }
+    }
+    $svRespExport |
+        Select-Object AgentName, AgentEmail, UserId, ConversationId, SurveyId, Status, TotalScorePct, NpsScore, NpsBand, CompletedDate |
+        Sort-Object AgentName, CompletedDate |
+        Export-Csv -Path (Join-Path $OutputDir 'SurveyResponses.csv') -NoTypeInformation
+}
+
+if ($sentimentRows.Count -gt 0) {
+    $sentExport = @()
+    foreach ($r in $sentimentRows) {
+        $sentExport += New-Object PSObject -Property @{
+            AgentName = Get-GcUserName -Id $r.UserId; AgentEmail = Get-GcUserEmail -Id $r.UserId
+            UserId = $r.UserId; ConversationId = $r.ConversationId
+            SentimentScore = $r.SentimentScore; SentimentTrend = $r.SentimentTrend
+        }
+    }
+    $sentExport |
+        Select-Object AgentName, AgentEmail, UserId, ConversationId, SentimentScore, SentimentTrend |
+        Sort-Object AgentName |
+        Export-Csv -Path (Join-Path $OutputDir 'Sentiment.csv') -NoTypeInformation
+}
+
 # ---- Per-agent roll-up ----
 Write-Host 'Building per-agent behavior roll-up...' -ForegroundColor Cyan
 $summaryRows = @()
@@ -921,6 +1448,36 @@ foreach ($u in $users) {
         if ($r.WasEdited -eq 'Yes') { $cpEdited += 1 }
     }
 
+    $evalCount = 0; $evalAvg = ''
+    foreach ($r in $evalRows) {
+        if ($r.UserId -eq $uid) { $evalCount = $r.Evaluations; $evalAvg = $r.AvgTotalScorePct }
+    }
+
+    $svScored = 0; $svAvg = ''
+    foreach ($r in $surveyAggRows) {
+        if ($r.UserId -eq $uid) { $svScored = $r.SurveysScored; $svAvg = $r.AvgTotalScorePct }
+    }
+
+    $npsProm = 0; $npsPass = 0; $npsDet = 0
+    foreach ($r in $surveyRespRows) {
+        if ($r.UserId -ne $uid) { continue }
+        if     ($r.NpsBand -eq 'Promoter')  { $npsProm += 1 }
+        elseif ($r.NpsBand -eq 'Passive')   { $npsPass += 1 }
+        elseif ($r.NpsBand -eq 'Detractor') { $npsDet  += 1 }
+    }
+    $npsTotal = $npsProm + $npsPass + $npsDet
+    $npsValue = ''
+    if ($npsTotal -gt 0) { $npsValue = [string][int]((($npsProm - $npsDet) * 100) / $npsTotal) }
+
+    $sentSum = 0; $sentCount = 0
+    foreach ($r in $sentimentRows) {
+        if ($r.UserId -ne $uid) { continue }
+        $sentSum += [double]$r.SentimentScore
+        $sentCount += 1
+    }
+    $sentAvg = ''
+    if ($sentCount -gt 0) { $sentAvg = ('{0:N1}' -f ($sentSum / $sentCount)) }
+
     $summaryRows += New-Object PSObject -Property @{
         AgentName            = $u.Name
         AgentEmail           = $u.Email
@@ -932,6 +1489,16 @@ foreach ($u in $users) {
         AvailableHours       = ('{0:N2}' -f $availableHours)
         AwayBreakHours       = ('{0:N2}' -f $awayHours)
         WfmAdherenceState    = $adherence
+        AvgEvalScorePct      = $evalAvg
+        Evaluations          = $evalCount
+        AvgSurveyScorePct    = $svAvg
+        SurveysScored        = $svScored
+        Nps                  = $npsValue
+        NpsPromoters         = $npsProm
+        NpsPassives          = $npsPass
+        NpsDetractors        = $npsDet
+        AvgSentiment         = $sentAvg
+        SentimentConvs       = $sentCount
         KbFeedbackCount      = $kbCount
         CopilotSummariesSeen = $cpSummaries
         CopilotFeedbackCount = $cpFeedback
@@ -940,7 +1507,7 @@ foreach ($u in $users) {
 }
 
 $summaryRows |
-    Select-Object AgentName, AgentEmail, UserId, Offered, Answered, HandleHours, OnQueueHours, AvailableHours, AwayBreakHours, WfmAdherenceState, KbFeedbackCount, CopilotSummariesSeen, CopilotFeedbackCount, CopilotNotesEdited |
+    Select-Object AgentName, AgentEmail, UserId, Offered, Answered, HandleHours, OnQueueHours, AvailableHours, AwayBreakHours, WfmAdherenceState, AvgEvalScorePct, Evaluations, AvgSurveyScorePct, SurveysScored, Nps, NpsPromoters, NpsPassives, NpsDetractors, AvgSentiment, SentimentConvs, KbFeedbackCount, CopilotSummariesSeen, CopilotFeedbackCount, CopilotNotesEdited |
     Sort-Object AgentName |
     Export-Csv -Path (Join-Path $OutputDir 'AgentBehaviorSummary.csv') -NoTypeInformation
 
@@ -949,7 +1516,13 @@ Write-Host ('DONE. Reports written to ' + $OutputDir) -ForegroundColor Green
 Write-Host '  Agents.csv               - directory of matched agents'
 Write-Host '  CallActivity.csv         - offered/answered, talk/hold/ACW/handle time'
 Write-Host '  StatusTime.csv           - hours per presence + routing status'
+Write-Host '  MediaTypeBreakdown.csv   - interactions per agent by media type'
+Write-Host '  WrapUpCodes.csv          - wrap-up code distribution per agent'
 Write-Host '  WfmAdherence.csv         - real-time WFM adherence state'
+Write-Host '  EvaluationScores.csv     - QM evaluation avg total/critical score'
+Write-Host '  SurveyScores.csv         - survey score aggregates per agent'
+Write-Host '  SurveyResponses.csv      - individual surveys with NPS band'
+Write-Host '  Sentiment.csv            - STA sentiment per conversation/agent'
 Write-Host '  KbFeedback.csv           - individual KB feedback submissions'
 Write-Host '  CopilotSummaries.csv     - AI summaries, feedback + edit signals'
 Write-Host '  AgentBehaviorSummary.csv - one row per agent, everything joined'
